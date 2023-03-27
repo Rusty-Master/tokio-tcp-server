@@ -1,10 +1,12 @@
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::actors::{BuyOrder, Message, OrderBookActor};
+use crate::order_tracker::{GetTrackerActor, TrackerActor, TrackerMessage};
 
 mod actors;
+mod order_tracker;
 
 #[tokio::main]
 async fn main() {
@@ -14,9 +16,15 @@ async fn main() {
     println!("Listening on: {addr}");
 
     let (tx, rx) = mpsc::channel::<Message>(1);
+    let (tracker_tx, tracker_rx) = mpsc::channel::<TrackerMessage>(1);
+    let tracker_tx_one = tracker_tx.clone();
+
+    tokio::spawn(async {
+        TrackerActor::new(tracker_rx).run().await;
+    });
 
     tokio::spawn(async move {
-        let order_book_actor = OrderBookActor::new(rx, 20.0);
+        let order_book_actor = OrderBookActor::new(rx, tracker_tx_one.clone(), 20.0);
         order_book_actor.run().await;
     });
     println!("Order book is running now");
@@ -24,6 +32,7 @@ async fn main() {
     while let Ok((mut stream, peer)) = socket.accept().await {
         println!("Incoming connection from: {peer}");
         let tx_one = tx.clone();
+        let tracker_tx_two = tracker_tx.clone();
         tokio::spawn(async move {
             println!("thread starting: {peer} starting");
             let (reader, mut writer) = stream.split();
@@ -45,11 +54,31 @@ async fn main() {
                             .map(|x| x.to_string().replace('\n', ""))
                             .collect();
 
-                        let amount = data[0].parse::<f32>().unwrap();
+                        println!("here is the data {:?}", data);
+                        let command = data[0].clone();
 
-                        let order_actor = BuyOrder::new(amount, data[1].clone(), tx_one.clone());
-                        println!("{}: {}", order_actor.ticker, order_actor.amount);
-                        order_actor.send().await;
+                        match command.as_str() {
+                            "BUY" => {
+                                println!("BUY command processed.");
+                                let amount = data[1].parse::<f32>().unwrap();
+                                let order_actor =
+                                    BuyOrder::new(amount, data[2].clone(), tx_one.clone());
+                                println!("{}: {}", order_actor.ticker, order_actor.amount);
+                                order_actor.send().await;
+                            }
+                            "GET" => {
+                                println!("GET command processed.");
+                                let get_actor = GetTrackerActor {
+                                    sender: tracker_tx_two.clone(),
+                                };
+
+                                let state = get_actor.send().await;
+                                println!("Sending back: {:?}", state);
+                                writer.write_all(state.as_bytes()).await.unwrap();
+                            }
+                            _ => panic!("{} command not supported.", command),
+                        }
+
                         buf.clear();
                     }
                     Err(e) => println!("Error receiving message: {e}"),
